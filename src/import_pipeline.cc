@@ -108,6 +108,10 @@ struct ActiveThread {
 
 enum class ShouldParse { Yes, No, NoSuchFile };
 
+struct ConsumedDependencyCollector {
+  std::vector<std::string> dependencies;
+};
+
 // Checks if |path| needs to be reparsed. This will modify cached state
 // such that calling this function twice with the same path may return true
 // the first time but will return false the second.
@@ -119,6 +123,7 @@ ShouldParse FileNeedsParse(
     IModificationTimestampFetcher* modification_timestamp_fetcher,
     ImportManager* import_manager,
     ICacheManager* cache_manager,
+    ConsumedDependencyCollector* consumed_dependency_collector,
     IndexFile* opt_previous_index,
     const std::string& path,
     const std::vector<std::string>& args,
@@ -131,9 +136,11 @@ ShouldParse FileNeedsParse(
 
   // If the file is a dependency but another file as already imported it,
   // don't bother.
-  if (!is_interactive && from &&
-      !import_manager->TryMarkDependencyImported(path)) {
-    return ShouldParse::No;
+  if (!is_interactive && from) {
+    if (import_manager->TryMarkDependencyImported(path))
+      consumed_dependency_collector->dependencies.push_back(path);
+    else
+      return ShouldParse::No;
   }
 
   optional<int64_t> modification_timestamp =
@@ -163,9 +170,8 @@ ShouldParse FileNeedsParse(
   return ShouldParse::No;
 };
 
-enum CacheLoadResult { Parse, DoNotParse };
-CacheLoadResult TryLoadFromCache(
-    FileConsumerSharedState* file_consumer_shared,
+// Returns a list of paths that need to be parsed.
+std::vector<std::string> LoadFromCache(
     TimestampManager* timestamp_manager,
     IModificationTimestampFetcher* modification_timestamp_fetcher,
     ImportManager* import_manager,
@@ -173,11 +179,16 @@ CacheLoadResult TryLoadFromCache(
     bool is_interactive,
     const Project::Entry& entry,
     const std::string& path_to_index) {
-  // Always run this block, even if we are interactive, so we can check
-  // dependencies and reset files in |file_consumer_shared|.
+  // If there is no previous index then we need to reparse the main file. There
+  // is no dependency information available.
   IndexFile* previous_index = cache_manager->TryLoad(path_to_index);
   if (!previous_index)
-    return CacheLoadResult::Parse;
+    return {path_to_index};
+
+  // We maintain two lists of files. |to_parse| will be sent to the parser, and
+  // |consumed_dependency_collector| will be preloaded.
+  std::vector<std::string> to_parse;
+  ConsumedDependencyCollector consumed_dependency_collector;
 
   // If none of the dependencies have changed and the index is not
   // interactive (ie, requested by a file save), skip parsing and just load
@@ -186,41 +197,27 @@ CacheLoadResult TryLoadFromCache(
   // Check timestamps and update |file_consumer_shared|.
   ShouldParse path_state = FileNeedsParse(
       is_interactive, timestamp_manager, modification_timestamp_fetcher,
-      import_manager, cache_manager, previous_index, path_to_index, entry.args,
-      nullopt);
+      import_manager, cache_manager, &consumed_dependency_collector,
+      previous_index, path_to_index, entry.args, nullopt);
   if (path_state == ShouldParse::Yes)
-    file_consumer_shared->Reset(path_to_index);
+    to_parse.push_back(path_to_index);
 
   // Target file does not exist on disk, do not emit any indexes.
-  // TODO: Dependencies should be reassigned to other files. We can do this by
-  // updating the "primary_file" if it doesn't exist. Might not actually be a
-  // problem in practice.
+  // TODO: Discover any old dependencies and reassign them new primary files.
   if (path_state == ShouldParse::NoSuchFile)
-    return CacheLoadResult::DoNotParse;
-
-  bool needs_reparse = is_interactive || path_state == ShouldParse::Yes;
+    return {};
 
   for (const std::string& dependency : previous_index->dependencies) {
     assert(!dependency.empty());
 
     if (FileNeedsParse(is_interactive, timestamp_manager,
                        modification_timestamp_fetcher, import_manager,
-                       cache_manager, previous_index, dependency, entry.args,
+                       cache_manager, &consumed_dependency_collector,
+                       previous_index, dependency, entry.args,
                        previous_index->path) == ShouldParse::Yes) {
-      needs_reparse = true;
-
-      // Do not break here, as we need to update |file_consumer_shared| for
-      // every dependency that needs to be reparsed.
-      file_consumer_shared->Reset(dependency);
+      to_parse.push_back(dependency);
     }
   }
-
-  // FIXME: should we still load from cache?
-  if (needs_reparse)
-    return CacheLoadResult::Parse;
-
-  // No timestamps changed - load directly from cache.
-  LOG_S(INFO) << "Skipping parse; no timestamp change for " << path_to_index;
 
   // TODO/FIXME: real perf
   PerformanceImportFile perf;
@@ -228,38 +225,31 @@ CacheLoadResult TryLoadFromCache(
   std::vector<Index_DoIdMap> result;
   result.push_back(Index_DoIdMap(cache_manager->TakeOrLoad(path_to_index), perf,
                                  is_interactive, false /*write_to_disk*/));
-  for (const std::string& dependency : previous_index->dependencies) {
-    // Only load a dependency if it is not already loaded.
-    //
-    // This is important for perf in large projects where there are lots of
-    // dependencies shared between many files.
-    if (!file_consumer_shared->Mark(dependency))
-      continue;
-
+  for (const std::string& dependency :
+       consumed_dependency_collector.dependencies) {
     LOG_S(INFO) << "Emitting index result for " << dependency << " (via "
                 << previous_index->path << ")";
 
     std::unique_ptr<IndexFile> dependency_index =
         cache_manager->TryTakeOrLoad(dependency);
-
-    // |dependency_index| may be null if there is no cache for it but
-    // another file has already started importing it.
+    // Dependency cache may not exist for whatever reason.
     if (!dependency_index)
       continue;
-
     result.push_back(Index_DoIdMap(std::move(dependency_index), perf,
                                    is_interactive, false /*write_to_disk*/));
   }
 
   QueueManager::instance()->do_id_map.EnqueueAll(std::move(result));
-  return CacheLoadResult::DoNotParse;
+
+  return to_parse;
 }
 
 std::vector<FileContents> PreloadFileContents(
     ICacheManager* cache_manager,
     const Project::Entry& entry,
     const std::string& entry_contents,
-    const std::string& path_to_index) {
+    const std::string& path_to_index,
+    const std::vector<std::string>& paths_to_preload) {
   FileContents contents(entry.filename, entry_contents);
 
   // Load file contents for all dependencies into memory. If the dependencies
@@ -276,18 +266,17 @@ std::vector<FileContents> PreloadFileContents(
   bool loaded_primary = contents.path == path_to_index;
 
   std::vector<FileContents> file_contents = {contents};
-  cache_manager->IterateLoadedCaches([&](IndexFile* index) {
+  for (const auto& path : paths_to_preload) {
     optional<std::string> index_content =
-        cache_manager->LoadCachedFileContents(index->path);
+        cache_manager->LoadCachedFileContents(path);
     if (!index_content) {
-      LOG_S(ERROR) << "Failed to load index content for " << index->path;
-      return;
+      LOG_S(ERROR) << "Failed to load index content for " << path;
+      continue;
     }
 
-    file_contents.push_back(FileContents(index->path, *index_content));
-
-    loaded_primary = loaded_primary || index->path == path_to_index;
-  });
+    file_contents.push_back(FileContents(path, *index_content));
+    loaded_primary = loaded_primary || path == path_to_index;
+  }
 
   if (!loaded_primary) {
     optional<std::string> content =
@@ -325,17 +314,26 @@ void ParseFile(Config* config,
       path_to_index = entry_cache->import_file;
   }
 
-  // Try to load the file from cache.
-  if (TryLoadFromCache(file_consumer_shared, timestamp_manager,
-                       modification_timestamp_fetcher, import_manager,
-                       cache_manager, is_interactive, entry,
-                       path_to_index) == CacheLoadResult::DoNotParse) {
+  // Try to load the file from cache. This does more than just loading from
+  // cache - ie, it also updates |file_consumer_shared|.
+  std::vector<std::string> paths_to_parse = LoadFromCache(
+      timestamp_manager, modification_timestamp_fetcher, import_manager,
+      cache_manager, is_interactive, entry, path_to_index);
+
+  if (paths_to_parse.empty()) {
+    LOG_S(INFO) << "Skipping parse for " << path_to_index;
     return;
   }
 
   LOG_S(INFO) << "Parsing " << path_to_index;
-  std::vector<FileContents> file_contents =
-      PreloadFileContents(cache_manager, entry, entry_contents, path_to_index);
+
+  // TODO/FIXME: should we try to claim these paths for ourselves, ie, so
+  // another thread does not steal them?
+  for (const auto& path : paths_to_parse)
+    file_consumer_shared->Reset(path);
+
+  std::vector<FileContents> file_contents = PreloadFileContents(
+      cache_manager, entry, entry_contents, path_to_index, paths_to_parse);
 
   std::vector<Index_DoIdMap> result;
   PerformanceImportFile perf;
@@ -343,16 +341,14 @@ void ParseFile(Config* config,
       indexer->Index(config, file_consumer_shared, path_to_index, entry.args,
                      file_contents, &perf);
   for (std::unique_ptr<IndexFile>& new_index : indexes) {
-    Timer time;
-
     // Only emit diagnostics for non-interactive sessions, which makes it easier
     // to identify indexing problems. For interactive sessions, diagnostics are
     // handled by code completion.
     if (!is_interactive)
       EmitDiagnostics(working_files, new_index->path, new_index->diagnostics_);
 
-    // When main thread does IdMap request it will request the previous index if
-    // needed.
+    // querydb will determine if we need to load a previous index during the
+    // DoIdMap request
     LOG_S(INFO) << "Emitting index result for " << new_index->path;
     result.push_back(Index_DoIdMap(std::move(new_index), perf, is_interactive,
                                    true /*write_to_disk*/));
@@ -765,9 +761,11 @@ TEST_SUITE("ImportPipeline") {
       optional<std::string> from;
       if (is_dependency)
         from = std::string("---.cc");
+      ConsumedDependencyCollector consumed_dependency_collector;
       return FileNeedsParse(is_interactive /*is_interactive*/,
                             &timestamp_manager, &modification_timestamp_fetcher,
                             &import_manager, cache_manager.get(),
+                            &consumed_dependency_collector,
                             opt_previous_index.get(), file, new_args, from);
     };
 
