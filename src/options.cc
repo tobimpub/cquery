@@ -4,9 +4,8 @@
 
 #include <iostream>
 
-std::unordered_map<std::string, std::string> ParseOptions(int argc,
-                                                          char** argv) {
-  std::unordered_map<std::string, std::string> output;
+Options ParseOptions(int argc, char** argv) {
+  Options output;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -24,7 +23,6 @@ std::unordered_map<std::string, std::string> ParseOptions(int argc,
   return output;
 }
 
-bool HasOption(const std::unordered_map<std::string, std::string>& options,
-               const std::string& option) {
+bool HasOption(const Options& options, const std::string& option) {
   return options.find(option) != options.end();
 }

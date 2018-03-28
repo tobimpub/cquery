@@ -380,8 +380,7 @@ void LanguageServerMain(const std::string& bin_name,
 int main(int argc, char** argv) {
   TraceMe();
 
-  std::unordered_map<std::string, std::string> options =
-      ParseOptions(argc, argv);
+  Options options = ParseOptions(argc, argv);
 
   if (HasOption(options, "-h") || HasOption(options, "--help")) {
     PrintHelp();

@@ -1,9 +1,11 @@
 #pragma once
 
+#include <string>
 #include <unordered_map>
 
-std::unordered_map<std::string, std::string> ParseOptions(int argc,
-                                                          char** argv);
+using Options = std::unordered_map<std::string, std::string>;
 
-bool HasOption(const std::unordered_map<std::string, std::string>& options,
+Options ParseOptions(int argc, char** argv);
+
+bool HasOption(const Options& options,
                const std::string& option);
